@@ -1,0 +1,276 @@
+# ============================================================
+# ANALISIS EKSPRESI GEN MICROARRAY + ENRICHMENT
+# Dataset  : GSE5620
+# Organism : Arabidopsis thaliana
+# Platform : Affymetrix ATH1
+# Tujuan   : DEG + GO + KEGG
+# Perbandingan : Shoot 0h vs Shoot 24h Cold
+# ============================================================
+
+# ================================
+# A. INSTALL & LOAD PACKAGE
+# ================================
+
+if (!require("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+BiocManager::install(c(
+  "GEOquery",
+  "limma",
+  "ath1121501.db",
+  "org.At.tair.db",
+  "clusterProfiler",
+  "enrichplot"
+), ask = FALSE, update = FALSE)
+
+install.packages(c("pheatmap","ggplot2","dplyr"))
+
+if (!requireNamespace("umap", quietly = TRUE)) {
+  install.packages("umap")
+}
+
+library(GEOquery)
+library(limma)
+library(pheatmap)
+library(ggplot2)
+library(dplyr)
+library(AnnotationDbi)
+library(clusterProfiler)
+library(enrichplot)
+library(ath1121501.db)
+library(org.At.tair.db)
+library(umap)
+
+# ================================
+# B. DOWNLOAD DATA GEO
+# ================================
+
+gset <- getGEO("GSE5620", GSEMatrix = TRUE)[[1]]
+
+ex <- exprs(gset)
+
+# ================================
+# C. LOG2 TRANSFORMASI
+# ================================
+
+qx <- as.numeric(quantile(ex,
+                          c(0,0.25,0.5,0.75,0.99,1),
+                          na.rm=TRUE))
+
+LogTransform <- (qx[5] > 100) ||
+  (qx[6]-qx[1] > 50 && qx[2] > 0)
+
+if (LogTransform) {
+  ex[ex <= 0] <- NA
+  ex <- log2(ex)
+}
+
+# ================================
+# D. FILTER SAMPEL (SHOOT)
+# ================================
+
+pdata <- pData(gset)
+
+shoot_samples <- grep("shoot",
+                      pdata$title,
+                      ignore.case = TRUE)
+
+gset <- gset[, shoot_samples]
+ex <- exprs(gset)
+
+pdata <- pData(gset)
+
+control_samples <- grep("0h", pdata$title)
+cold_samples <- grep("24h", pdata$title)
+
+selected <- c(control_samples, cold_samples)
+
+gset <- gset[, selected]
+ex <- exprs(gset)
+
+# ================================
+# E. DEFINISI GRUP
+# ================================
+
+group <- c(
+  rep("Control", length(control_samples)),
+  rep("Cold24h", length(cold_samples))
+)
+
+gset$group <- factor(group)
+
+design <- model.matrix(~0 + gset$group)
+colnames(design) <- levels(gset$group)
+
+contrast_matrix <- makeContrasts(
+  Cold24h-Control,
+  levels = design
+)
+
+# ================================
+# F. ANALISIS DEG (LIMMA)
+# ================================
+
+fit <- lmFit(ex, design)
+fit2 <- contrasts.fit(fit, contrast_matrix)
+fit2 <- eBayes(fit2)
+
+topTableResults <- topTable(
+  fit2,
+  adjust="fdr",
+  number=Inf
+)
+
+# ================================
+# G. ANOTASI PROBE
+# ================================
+
+probe_ids <- rownames(topTableResults)
+
+gene_annotation <- AnnotationDbi::select(
+  ath1121501.db,
+  keys = probe_ids,
+  columns = c("SYMBOL","GENENAME"),
+  keytype = "PROBEID"
+)
+
+topTableResults$PROBEID <- rownames(topTableResults)
+
+topTableResults <- merge(
+  topTableResults,
+  gene_annotation,
+  by="PROBEID",
+  all.x=TRUE
+)
+
+# ================================
+# H. BUAT FOLDER OUTPUT
+# ================================
+
+if (!dir.exists("Hasil_Plot")) {
+  dir.create("Hasil_Plot")
+}
+
+# ================================
+# I. BOXPLOT QC
+# ================================
+
+png("Hasil_Plot/Boxplot.png",
+    width=2000,height=1200,res=300)
+
+boxplot(ex,
+        col=as.numeric(gset$group),
+        las=2,
+        outline=FALSE,
+        main="Distribusi Ekspresi")
+
+dev.off()
+
+# ================================
+# J. UMAP
+# ================================
+
+umap_input <- t(ex)
+umap_result <- umap(umap_input)
+
+umap_df <- data.frame(
+  UMAP1=umap_result$layout[,1],
+  UMAP2=umap_result$layout[,2],
+  Group=gset$group
+)
+
+p_umap <- ggplot(umap_df,
+                 aes(UMAP1,UMAP2,color=Group)) +
+  geom_point(size=3) +
+  theme_minimal()
+
+ggsave("Hasil_Plot/UMAP.png",
+       p_umap,width=6,height=5,dpi=300)
+
+# ================================
+# K. VOLCANO PLOT
+# ================================
+
+volcano_data <- data.frame(
+  logFC=topTableResults$logFC,
+  adj.P.Val=topTableResults$adj.P.Val
+)
+
+volcano_data$status <- "NO"
+volcano_data$status[
+  volcano_data$logFC > 1 &
+  volcano_data$adj.P.Val < 0.01] <- "UP"
+
+volcano_data$status[
+  volcano_data$logFC < -1 &
+  volcano_data$adj.P.Val < 0.01] <- "DOWN"
+
+p_volcano <- ggplot(volcano_data,
+                    aes(logFC,
+                        -log10(adj.P.Val),
+                        color=status)) +
+  geom_point(alpha=0.6) +
+  theme_minimal()
+
+ggsave("Hasil_Plot/Volcano.png",
+       p_volcano,width=6,height=5,dpi=300)
+
+# ================================
+# L. HEATMAP TOP GENES
+# ================================
+
+topTableResults <- topTableResults[
+  order(topTableResults$adj.P.Val),]
+
+top50 <- head(topTableResults,50)
+
+mat_heatmap <- ex[top50$PROBEID,]
+
+pheatmap(mat_heatmap,
+         scale="row",
+         filename="Hasil_Plot/Heatmap.png")
+
+# ================================
+# M. ENRICHMENT ANALYSIS
+# ================================
+
+deg <- topTableResults %>%
+  filter(adj.P.Val < 0.01 &
+         !is.na(SYMBOL)) %>%
+  pull(SYMBOL) %>%
+  unique()
+
+entrez <- bitr(deg,
+               fromType="SYMBOL",
+               toType="ENTREZID",
+               OrgDb=org.At.tair.db)
+
+ego <- enrichGO(
+  gene=entrez$ENTREZID,
+  OrgDb=org.At.tair.db,
+  ont="BP",
+  readable=TRUE
+)
+
+ekegg <- enrichKEGG(
+  gene=entrez$ENTREZID,
+  organism="ath"
+)
+
+p_go <- dotplot(ego)
+ggsave("Hasil_Plot/GO.png",
+       p_go,width=7,height=6,dpi=300)
+
+p_kegg <- dotplot(ekegg)
+ggsave("Hasil_Plot/KEGG.png",
+       p_kegg,width=7,height=6,dpi=300)
+
+# ================================
+# N. SIMPAN HASIL
+# ================================
+
+write.csv(topTableResults,
+          "Hasil_DEG_GSE5620.csv")
+
+message("Analisis selesai")
