@@ -1,9 +1,9 @@
 # ============================================================
 # ANALISIS EKSPRESI GEN MICROARRAY + ENRICHMENT
-# Dataset  : GSE5620
+# Dataset : GSE5620
 # Organism : Arabidopsis thaliana
 # Platform : Affymetrix ATH1
-# Tujuan   : DEG + GO + KEGG
+# Tujuan : DEG + GO + KEGG (ALL, UP, DOWN)
 # Perbandingan : Shoot 0h vs Shoot 24h Cold
 # ============================================================
 
@@ -11,10 +11,12 @@
 # A. INSTALL & LOAD PACKAGE
 # ================================
 
+#1. Install BiocManager (manajer paket Bioconductor)
 if (!require("BiocManager", quietly = TRUE)) {
   install.packages("BiocManager")
 }
 
+# 2. Install paket Bioconductor (GEOquery & limma) dan Install annotation package sesuai platform
 BiocManager::install(c(
   "GEOquery",
   "limma",
@@ -24,12 +26,15 @@ BiocManager::install(c(
   "enrichplot"
 ), ask = FALSE, update = FALSE)
 
+
+#3. Install paket CRAN untuk visualisasi dan manipulasi data 
 install.packages(c("pheatmap","ggplot2","dplyr"))
 
 if (!requireNamespace("umap", quietly = TRUE)) {
   install.packages("umap")
 }
 
+#4. Memanggil library 
 library(GEOquery)
 library(limma)
 library(pheatmap)
@@ -45,89 +50,127 @@ library(umap)
 # ================================
 # B. DOWNLOAD DATA GEO
 # ================================
+library(GEOquery)
 
-gset <- getGEO("GSE5620", GSEMatrix = TRUE)[[1]]
+# ------------------------------------------------------------
+# 2. DOWNLOAD & VALIDASI (COORDINATING COLD STRESS)
+# ------------------------------------------------------------
+# getGPL & AnnotGPL = FALSE agar tidak error HTTP/Timeout
+gset <- getGEO("GSE5620", destdir = ".", getGPL = FALSE, AnnotGPL = FALSE)
+if (class(gset) == "list") gset <- gset[[1]]
 
+pdata <- pData(gset)
+
+# ambil matriks ekspresi
 ex <- exprs(gset)
 
 # ================================
 # C. LOG2 TRANSFORMASI
 # ================================
+ex <- exprs(gset)
+qx <- as.numeric(quantile(ex, c(0,0.25,0.5,0.75,0.99,1), na.rm = TRUE))
+LogTransform <- (qx[5] > 100) || (qx[6]-qx[1] > 50 && qx[2] > 0)
 
-qx <- as.numeric(quantile(ex,
-                          c(0,0.25,0.5,0.75,0.99,1),
-                          na.rm=TRUE))
-
-LogTransform <- (qx[5] > 100) ||
-  (qx[6]-qx[1] > 50 && qx[2] > 0)
-
-if (LogTransform) {
+if(LogTransform){
   ex[ex <= 0] <- NA
   ex <- log2(ex)
+  print("Data di-log2 transform")
+} else {
+  print("Data sudah dalam skala log, tidak di-transform lagi")
 }
 
-# ================================
-# D. FILTER SAMPEL (SHOOT)
-# ================================
+# ========================================
+# METADATA
+# ========================================
 
 pdata <- pData(gset)
 
-shoot_samples <- grep("shoot",
-                      pdata$title,
-                      ignore.case = TRUE)
+# lihat semua nama sampel
+pdata$title
+
+
+
+# ========================================
+# FILTER SHOOTS
+# ========================================
+shoot_samples <- grep("Shoots", pdata$title)
 
 gset <- gset[, shoot_samples]
-ex <- exprs(gset)
 
+ex <- ex[, shoot_samples]
 pdata <- pData(gset)
 
-control_samples <- grep("0h", pdata$title)
-cold_samples <- grep("24h", pdata$title)
+dim(ex)
 
-selected <- c(control_samples, cold_samples)
+# ========================================
+# FILTER TIME POINT
+# ========================================
+
+t0_samples <- grep("Shoots-0h_", pdata$title)
+t24_samples <- grep("Shoots-24.0h_", pdata$title)
+
+selected <- c(t0_samples, t24_samples)
 
 gset <- gset[, selected]
-ex <- exprs(gset)
+
+ex <- ex[, selected]
+pdata <- pData(gset)
+
+pdata$title
+
+
+dim(ex)
+range(ex)
+
 
 # ================================
 # E. DEFINISI GRUP
 # ================================
+group <- factor(c("T0","T0","T24","T24"))
 
-group <- c(
-  rep("Control", length(control_samples)),
-  rep("Cold24h", length(cold_samples))
-)
+table(group)
 
-gset$group <- factor(group)
+# ================================
+# F. DESAIN MATRIX
+# ================================
+design <- model.matrix(~0 + group)
+colnames(design) <- levels(group)
 
-design <- model.matrix(~0 + gset$group)
-colnames(design) <- levels(gset$group)
-
-contrast_matrix <- makeContrasts(
-  Cold24h-Control,
-  levels = design
-)
 
 # ================================
 # F. ANALISIS DEG (LIMMA)
 # ================================
+# ================================
+# DIFFERENTIAL EXPRESSION
+# ================================
 
 fit <- lmFit(ex, design)
+
+contrast_matrix <- makeContrasts(
+  T24 - T0,
+  levels = design
+)
+
 fit2 <- contrasts.fit(fit, contrast_matrix)
 fit2 <- eBayes(fit2)
 
-topTableResults <- topTable(
+deg <- topTable(
   fit2,
-  adjust="fdr",
-  number=Inf
+  adjust = "BH",
+  number = Inf
 )
+
+write.csv(deg,"DEG_GSE5620_shoot_0h_vs_24h.csv")
+
 
 # ================================
 # G. ANOTASI PROBE
 # ================================
 
-probe_ids <- rownames(topTableResults)
+# Ambil ID probe dari baris nama variabel 'deg'
+probe_ids <- rownames(deg)
 
+# Ambil anotasi dari library ath1121501.db
 gene_annotation <- AnnotationDbi::select(
   ath1121501.db,
   keys = probe_ids,
@@ -135,142 +178,406 @@ gene_annotation <- AnnotationDbi::select(
   keytype = "PROBEID"
 )
 
-topTableResults$PROBEID <- rownames(topTableResults)
+# Tambahkan kolom PROBEID ke data frame 'deg' supaya bisa di-merge
+deg$PROBEID <- rownames(deg)
 
-topTableResults <- merge(
-  topTableResults,
+# Gabungkan hasil DEG dengan anotasi gen
+deg <- merge(
+  deg,
   gene_annotation,
-  by="PROBEID",
-  all.x=TRUE
+  by = "PROBEID",
+  all.x = TRUE
 )
+
+# Cek hasil akhirnya
+head(deg)
 
 # ================================
 # H. BUAT FOLDER OUTPUT
 # ================================
+# Pakai satu nama yang konsisten
+folder_name <- "Hasil_Plot_Capstone"
 
-if (!dir.exists("Hasil_Plot")) {
-  dir.create("Hasil_Plot")
+if (!dir.exists(folder_name)) {
+  dir.create(folder_name)
 }
 
 # ================================
 # I. BOXPLOT QC
 # ================================
 
-png("Hasil_Plot/Boxplot.png",
-    width=2000,height=1200,res=300)
+# Kita gabungkan nama folder dan nama file pakai file.path biar aman
+png(file.path(folder_name, "Boxplot.png"),
+    width=2000, height=1200, res=300)
 
 boxplot(ex,
-        col=as.numeric(gset$group),
+        col=c("red", "red", "blue", "blue"), # Biar T0 dan T24 beda warna
         las=2,
         outline=FALSE,
-        main="Distribusi Ekspresi")
+        main="Distribusi Ekspresi (Normalized)")
 
 dev.off()
+# Kalau muncul "null device", langsung cek folder Hasil_Plot_Capstone!
+
+
 
 # ================================
-# J. UMAP
+# J. UMAP (REVISI UNTUK SAMPEL KECIL)
 # ================================
+library(umap)
 
+# 1. Atur konfigurasi UMAP khusus untuk sampel sedikit
+custom_config <- umap.defaults
+custom_config$n_neighbors <- 2 # Karena sampel kita cuma 4
+
+# 2. Jalankan UMAP dengan konfigurasi baru
 umap_input <- t(ex)
-umap_result <- umap(umap_input)
+umap_result <- umap(umap_input, config = custom_config)
 
+# 3. Buat data frame untuk plotting
 umap_df <- data.frame(
-  UMAP1=umap_result$layout[,1],
-  UMAP2=umap_result$layout[,2],
-  Group=gset$group
+  UMAP1 = umap_result$layout[,1],
+  UMAP2 = umap_result$layout[,2],
+  Group = group
 )
 
-p_umap <- ggplot(umap_df,
-                 aes(UMAP1,UMAP2,color=Group)) +
-  geom_point(size=3) +
-  theme_minimal()
+# 4. Visualisasi
+p_umap <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = Group)) +
+  geom_point(size = 5) +
+  geom_text(aes(label = rownames(umap_df)), vjust = -1, size = 3) + # Tambah label nama sampel
+  theme_minimal() +
+  labs(title = "UMAP Clustering (n_neighbors = 2)",
+       x = "UMAP Dimension 1",
+       y = "UMAP Dimension 2") +
+  scale_color_manual(values = c("T0" = "red", "T24" = "blue"))
 
-ggsave("Hasil_Plot/UMAP.png",
-       p_umap,width=6,height=5,dpi=300)
+# 5. Simpan ke folder
+ggsave(file.path("Hasil_Plot_Capstone", "UMAP.png"),
+       p_umap, width = 6, height = 5, dpi = 300)
 
-# ================================
-# K. VOLCANO PLOT
-# ================================
+print(p_umap)
 
-volcano_data <- data.frame(
-  logFC=topTableResults$logFC,
-  adj.P.Val=topTableResults$adj.P.Val
-)
 
-volcano_data$status <- "NO"
-volcano_data$status[
-  volcano_data$logFC > 1 &
-  volcano_data$adj.P.Val < 0.01] <- "UP"
+# ========================================
+# J. VOLCANO PLOT (REVISI SIMPAN)
+# ========================================
 
-volcano_data$status[
-  volcano_data$logFC < -1 &
-  volcano_data$adj.P.Val < 0.01] <- "DOWN"
+deg$gene <- rownames(deg)
 
-p_volcano <- ggplot(volcano_data,
-                    aes(logFC,
-                        -log10(adj.P.Val),
-                        color=status)) +
-  geom_point(alpha=0.6) +
-  theme_minimal()
+deg$status <- "NO"
+deg$status[deg$logFC > 0.5 & deg$P.Value < 0.05] <- "UP"
+deg$status[deg$logFC < -0.5 & deg$P.Value < 0.05] <- "DOWN"
 
-ggsave("Hasil_Plot/Volcano.png",
-       p_volcano,width=6,height=5,dpi=300)
+print("Statistik Gen:")
+table(deg$status)
+
+library(ggplot2)
+
+# --- PERBAIKAN DI SINI: Masukkan ke variabel p_volcano ---
+p_volcano <- ggplot(deg, aes(logFC, -log10(P.Value), color=status)) +
+  geom_point(alpha=0.6, size=2) +
+  geom_vline(xintercept = c(-0.5, 0.5), linetype = "dashed", color = "black", alpha = 0.5) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black", alpha = 0.5) +
+  theme_minimal() +
+  scale_color_manual(values=c(
+    "DOWN"="blue",
+    "NO"="grey",
+    "UP"="red"
+  )) +
+  labs(
+    title = "Volcano Plot: Shoot 0h vs 24h",
+    subtitle = "Threshold: |logFC| > 0.5 & P.Value < 0.05",
+    x = "log2 Fold Change",
+    y = "-log10 P-Value"
+  )
+
+# Sekarang p_volcano sudah ada, jadi ggsave & print nggak akan error lagi
+ggsave(file.path("Hasil_Plot_Capstone", "Volcano.png"),
+       p_volcano, width = 8, height = 6, dpi = 300)
+
+print(p_volcano)
+
 
 # ================================
 # L. HEATMAP TOP GENES
 # ================================
 
-topTableResults <- topTableResults[
-  order(topTableResults$adj.P.Val),]
+# 1. Urutkan berdasarkan P.Value (karena kita tadi pakai P.Value biasa)
+# Kalau mau tetap pakai adj.P.Val juga boleh, tapi pastikan variabelnya ada
+deg_sorted <- deg[order(deg$P.Value), ]
 
-top50 <- head(topTableResults,50)
+# 2. Ambil 50 gen teratas
+top50 <- head(deg_sorted, 50)
 
-mat_heatmap <- ex[top50$PROBEID,]
+# 3. Ambil data ekspresi hanya untuk 50 gen tersebut
+# Kita gunakan PROBEID sebagai index untuk mengambil baris di 'ex'
+mat_heatmap <- ex[top50$PROBEID, ]
 
+# 4. Ganti nama baris di matriks dengan SYMBOL gen (biar heatmap-nya bisa dibaca)
+# Kalau SYMBOL-nya kosong (NA), tetap pakai PROBEID
+rownames(mat_heatmap) <- ifelse(!is.na(top50$SYMBOL), top50$SYMBOL, top50$PROBEID)
+
+# 5. Gambar Heatmap
+library(pheatmap)
 pheatmap(mat_heatmap,
-         scale="row",
-         filename="Hasil_Plot/Heatmap.png")
+         scale = "row", # Penting! Supaya terlihat perbedaan ekspresi per gen
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean",
+         main = "Top 50 Differentially Expressed Genes",
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         filename = file.path("Hasil_Plot_Capstone", "Heatmap.png")) # Simpan ke folder yang benar
 
-# ================================
-# M. ENRICHMENT ANALYSIS
-# ================================
+# ========================================
+# K. ENRICHMENT ALL GENES (REVISI)
+# ========================================
 
-deg <- topTableResults %>%
-  filter(adj.P.Val < 0.01 &
-         !is.na(SYMBOL)) %>%
+# 1. Gunakan variabel 'deg' (hasil dari merge di bagian G)
+# Filter p-value < 0.05 agar data yang diuji cukup banyak
+deg_all_list <- deg %>%
+  filter(P.Value < 0.05 & !is.na(SYMBOL)) %>%
   pull(SYMBOL) %>%
   unique()
 
-entrez <- bitr(deg,
-               fromType="SYMBOL",
-               toType="ENTREZID",
-               OrgDb=org.At.tair.db)
+# 2. Konversi ke ENTREZID (WAJIB pakai org.At.tair.db untuk Arabidopsis)
+entrez_all <- bitr(deg_all_list,
+                   fromType = "SYMBOL",
+                   toType = "ENTREZID",
+                   OrgDb = org.At.tair.db)
 
-ego <- enrichGO(
-  gene=entrez$ENTREZID,
-  OrgDb=org.At.tair.db,
-  ont="BP",
-  readable=TRUE
+# GO Enrichment - ALL
+ego_all <- enrichGO(
+  gene = entrez_all$ENTREZID,
+  OrgDb = org.At.tair.db,
+  ont = "BP",
+  pvalueCutoff = 0.05,
+  readable = TRUE
 )
 
-ekegg <- enrichKEGG(
-  gene=entrez$ENTREZID,
-  organism="ath"
+p1 <- dotplot(ego_all, showCategory = 15) + ggtitle("GO BP - ALL DEG (Arabidopsis)")
+ggsave(file.path("Hasil_Plot_Capstone", "GO_BP_All_DEG.png"), plot = p1, width = 8, height = 6, dpi = 300)
+
+# KEGG Enrichment - ALL (Organism 'ath' untuk Arabidopsis)
+ekegg_all <- enrichKEGG(
+  gene = entrez_all$ENTREZID,
+  organism = "ath",
+  pvalueCutoff = 0.05
 )
 
-p_go <- dotplot(ego)
-ggsave("Hasil_Plot/GO.png",
-       p_go,width=7,height=6,dpi=300)
+# Hanya jalankan setReadable jika ada hasil KEGG
+if(!is.null(ekegg_all)) {
+  ekegg_all <- setReadable(ekegg_all, OrgDb = org.At.tair.db, keyType="ENTREZID")
+  p2 <- dotplot(ekegg_all, showCategory = 15) + ggtitle("KEGG - ALL DEG")
+  ggsave(file.path("Hasil_Plot_Capstone", "KEGG_All_DEG.png"), plot = p2, width = 8, height = 6, dpi = 300)
+}
 
-p_kegg <- dotplot(ekegg)
-ggsave("Hasil_Plot/KEGG.png",
-       p_kegg,width=7,height=6,dpi=300)
+# ========================================
+# L. ENRICHMENT UP vs DOWN (REVISI)
+# ========================================
 
-# ================================
-# N. SIMPAN HASIL
-# ================================
+# Filter UP dan DOWN sesuai status yang sudah kita buat di Volcano Plot
+deg_up_list <- deg %>% filter(status == "UP" & !is.na(SYMBOL)) %>% pull(SYMBOL) %>% unique()
+deg_down_list <- deg %>% filter(status == "DOWN" & !is.na(SYMBOL)) %>% pull(SYMBOL) %>% unique()
 
-write.csv(topTableResults,
-          "Hasil_DEG_GSE5620.csv")
+# Konversi ENTREZ
+entrez_up <- bitr(deg_up_list, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.At.tair.db)
+entrez_down <- bitr(deg_down_list, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.At.tair.db)
 
-message("Analisis selesai")
+# GO UP
+ego_up <- enrichGO(entrez_up$ENTREZID, OrgDb = org.At.tair.db, ont = "BP", pvalueCutoff = 0.05, readable = TRUE)
+p3 <- dotplot(ego_up, showCategory = 15) + ggtitle("GO BP - UP Genes")
+ggsave(file.path("Hasil_Plot_Capstone", "GO_BP_UP_DEG.png"), plot = p3, width = 8, height = 6, dpi = 300)
+
+# GO DOWN
+ego_down <- enrichGO(entrez_down$ENTREZID, OrgDb = org.At.tair.db, ont = "BP", pvalueCutoff = 0.05, readable = TRUE)
+p4 <- dotplot(ego_down, showCategory = 15) + ggtitle("GO BP - DOWN Genes")
+ggsave(file.path("Hasil_Plot_Capstone", "GO_BP_DOWN_DEG.png"), plot = p4, width = 8, height = 6, dpi = 300)
+
+
+# ========================================
+# K. ENRICHMENT ALL GENES (GO & KEGG)
+# ========================================
+
+# 1. Ambil semua gen signifikan
+deg_all_list <- deg %>%
+  filter(status != "NO" & !is.na(SYMBOL)) %>%
+  pull(SYMBOL) %>% unique()
+
+# Konversi ke TAIR untuk Arabidopsis
+entrez_all <- bitr(deg_all_list, fromType="SYMBOL", toType="TAIR", OrgDb=org.At.tair.db)
+
+# KEGG ALL dengan proteksi koneksi
+ekegg_all <- tryCatch({
+  enrichKEGG(gene = entrez_all$TAIR, organism = "ath", keyType = "tair", pvalueCutoff = 0.05)
+}, error = function(e) {
+  message("Cek Kondisi Internet!"); return(NULL)
+})
+
+if(!is.null(ekegg_all) && nrow(ekegg_all) > 0) {
+  ekegg_all <- setReadable(ekegg_all, OrgDb = org.At.tair.db, keyType="TAIR")
+  p_kegg_all <- dotplot(ekegg_all, showCategory = 15) + ggtitle("KEGG Pathway - ALL DEG")
+  ggsave(file.path("Hasil_Plot_Capstone", "KEGG_All_DEG.png"), p_kegg_all, width = 8, height = 6)
+  print(p_kegg_all)
+}
+
+# ========================================
+# L. ENRICHMENT UP vs DOWN (GO & KEGG)
+# ========================================
+
+# --- KATEGORI UP ---
+deg_up_list <- deg %>% filter(status == "UP" & !is.na(SYMBOL)) %>% pull(SYMBOL) %>% unique()
+entrez_up <- bitr(deg_up_list, fromType="SYMBOL", toType="TAIR", OrgDb=org.At.tair.db)
+
+ekegg_up <- tryCatch({
+  enrichKEGG(gene = entrez_up$TAIR, organism = "ath", keyType = "tair", pvalueCutoff = 0.05)
+}, error = function(e) { return(NULL) })
+
+if(!is.null(ekegg_up) && nrow(ekegg_up) > 0) {
+  ekegg_up <- setReadable(ekegg_up, OrgDb = org.At.tair.db, keyType="TAIR")
+  p_kegg_up <- dotplot(ekegg_up, showCategory = 15) + ggtitle("KEGG Pathway - UP Genes")
+  ggsave(file.path("Hasil_Plot_Capstone", "KEGG_UP_DEG.png"), p_kegg_up, width = 8, height = 6)
+  print(p_kegg_up)
+}
+
+# --- KATEGORI DOWN ---
+deg_down_list <- deg %>% filter(status == "DOWN" & !is.na(SYMBOL)) %>% pull(SYMBOL) %>% unique()
+entrez_down <- bitr(deg_down_list, fromType="SYMBOL", toType="TAIR", OrgDb=org.At.tair.db)
+
+ekegg_down <- tryCatch({
+  enrichKEGG(gene = entrez_down$TAIR, organism = "ath", keyType = "tair", pvalueCutoff = 0.05)
+}, error = function(e) { return(NULL) })
+
+if(!is.null(ekegg_down) && nrow(ekegg_down) > 0) {
+  ekegg_down <- setReadable(ekegg_down, OrgDb = org.At.tair.db, keyType="TAIR")
+  p_kegg_down <- dotplot(ekegg_down, showCategory = 15) + ggtitle("KEGG Pathway - DOWN Genes")
+  ggsave(file.path("Hasil_Plot_Capstone", "KEGG_DOWN_DEG.png"), p_kegg_down, width = 8, height = 6)
+  print(p_kegg_down)
+}
+
+# ========================================
+# M. MENYIMPAN HASIL AKHIR
+# ========================================
+
+# Simpan tabel DEG lengkap dengan anotasi
+write.csv(deg, "Hasil_Plot_Capstone/Hasil_Analisis_DEG_Final.csv", row.names = FALSE)
+
+
+
+# Ambil 20 Gen UP (logFC tertinggi)
+top20_up <- deg %>%
+  filter(status == "UP" & !is.na(SYMBOL)) %>%
+  arrange(desc(logFC)) %>%
+  head(20) %>% pull(SYMBOL)
+
+# Ambil 20 Gen DOWN (logFC terendah/paling negatif)
+top20_down <- deg %>%
+  filter(status == "DOWN" & !is.na(SYMBOL)) %>%
+  arrange(logFC) %>%
+  head(20) %>% pull(SYMBOL)
+
+# Tampilkan untuk di-copy
+print("DAFTAR GEN UP:")
+cat(top20_up, sep="\n")
+
+print("DAFTAR GEN DOWN:")
+cat(top20_down, sep="\n")
+
+
+# Ambil TAIR ID untuk gen UP
+kegg_up_list <- deg %>%
+  filter(status == "UP" & !is.na(PROBEID)) %>%
+  arrange(desc(logFC)) %>%
+  head(20) %>%
+  mutate(kegg_input = paste(PROBEID, "red")) %>%
+  pull(kegg_input)
+
+# Ambil TAIR ID untuk gen DOWN
+kegg_down_list <- deg %>%
+  filter(status == "DOWN" & !is.na(PROBEID)) %>%
+  arrange(logFC) %>%
+  head(20) %>%
+  mutate(kegg_input = paste(PROBEID, "blue")) %>%
+  pull(kegg_input)
+
+# Munculkan di console untuk di-copy
+cat("COPY INI KE KEGG MAPPER:\n")
+cat(c(kegg_up_list, kegg_down_list), sep="\n")
+
+# 1. Pastikan kita punya daftar gen yang bersih
+# Kita ambil SYMBOL karena g:Profiler tadi sukses pakai SYMBOL
+kegg_up <- deg %>%
+  filter(status == "UP" & !is.na(SYMBOL)) %>%
+  arrange(desc(logFC)) %>%
+  head(20) %>%
+  mutate(input = paste(SYMBOL, "red")) %>%
+  pull(input)
+
+kegg_down <- deg %>%
+  filter(status == "DOWN" & !is.na(SYMBOL)) %>%
+  arrange(logFC) %>%
+  head(20) %>%
+  mutate(input = paste(SYMBOL, "blue")) %>%
+  pull(input)
+
+# 2. Munculkan hasilnya
+cat("--- COPY DAFTAR DI BAWAH INI --- \n")
+cat(c(kegg_up, kegg_down), sep="\n")
+
+
+
+
+
+library(clusterProfiler)
+library(org.At.tair.db)
+
+
+# 1. Ambil daftar SYMBOL, tapi pastikan tidak ada NA dan harus unik
+# Kita ambil dari kolom SYMBOL yang sudah ada di tabel deg hasil merge sebelumnya
+probe_list <- deg %>%
+  filter(!is.na(SYMBOL) & SYMBOL != "") %>%
+  pull(SYMBOL) %>%
+  unique()
+
+# Cek dulu isinya, kalau muncul nama gen (misal: CBF1, COR15A), berarti sudah benar
+head(probe_list)
+
+# 2. Konversi menggunakan bitr dengan data yang sudah bersih
+# Jika SYMBOL gagal, kita akan coba pakai keytype 'PROBEID'
+id_map <- tryCatch({
+  bitr(probe_list,
+       fromType = "SYMBOL",
+       toType = "TAIR",
+       OrgDb = org.At.tair.db)
+}, error = function(e) {
+  message("SYMBOL gagal, mencoba konversi lewat PROBEID...")
+  bitr(deg$PROBEID,
+       fromType = "PROBEID",
+       toType = "TAIR",
+       OrgDb = ath1121501.db) # Pakai library chip untuk PROBEID
+})
+
+# 3. Lihat hasilnya
+head(id_map)
+
+
+# 1. Gabungkan id_map (TAIR) ke tabel DEG utama
+# Kita gunakan PROBEID sebagai kunci penggabung
+deg_final <- deg %>%
+  left_join(id_map, by = "PROBEID")
+
+# 2. Buat daftar untuk KEGG Mapper (Top 20 UP dan Top 20 DOWN)
+# Kita beri warna Merah untuk UP dan Biru untuk DOWN
+kegg_input <- deg_final %>%
+  filter(!is.na(TAIR)) %>%
+  group_by(status) %>%
+  slice_max(order_by = abs(logFC), n = 20) %>%
+  mutate(kegg_line = paste(TAIR, ifelse(status == "UP", "red", "blue"))) %>%
+  pull(kegg_line)
+
+# 3. Munculkan hasilnya di Console
+cat("\n--- COPY DAFTAR DI BAWAH INI KE WEBSITE KEGG MAPPER --- \n")
+cat(kegg_input, sep="\n")
+
+# 4. Simpan tabel final yang sudah ada TAIR ID-nya
+write.csv(deg_final, file.path(folder_name, "Hasil_Analisis_Lengkap_Annotated.csv"), row.names = FALSE)
+
+message("Tabel final sudah disimpan di folder Hasil_Plot_Capstone.")
